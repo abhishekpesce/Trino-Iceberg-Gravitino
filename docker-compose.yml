@@ -1,0 +1,138 @@
+version: "3"
+
+services:
+
+  postgres:
+    image: postgres:15
+    container_name: iceberg-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: iceberg
+      POSTGRES_USER: iceberg_user
+      POSTGRES_PASSWORD: iceberg_password
+    networks:
+      iceberg_net:
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: keycloak
+    restart: always
+    command: start-dev
+    environment:
+      KEYCLOAK_FRONTEND_URL: http://keycloak:8080
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: iceberg_user
+      KC_DB_PASSWORD: iceberg_password
+      KC_METRICS_ENABLED: true
+      KC_LOG_LEVEL: "INFO"
+     # KC_HOSTNAME: keycloak
+    ports:
+      - "9090:8080"
+    depends_on:
+      - postgres
+    networks:
+      iceberg_net:
+
+  rest:
+    build: ./rest  # Ensure this Dockerfile includes the PostgreSQL JDBC driver
+    container_name: iceberg-rest
+    networks:
+      iceberg_net:
+    ports:
+      - 8181:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      #- CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_IO_IMPL=org.apache.iceberg.azure.AzureFileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - REST_CATALOG_SERVICE_PORT=8181
+      - REST_CATALOG_SERVICE_SERVICE_PORT=8181
+      - REST_CATALOG_SERVICE_HOST=10.0.238.1  # Adjust based on your setup
+      - CATALOG_URI=jdbc:postgresql://postgres:5432/iceberg
+      - CATALOG_JDBC_DRIVER=org.postgresql.Driver
+      - CATALOG_JDBC_USER=iceberg_user
+      - CATALOG_JDBC_PASSWORD=iceberg_password
+      #- fs.native-azure.enabled=true
+      - azure.auth-type=ACCESS_KEY
+      #azure.application-id = Trino
+      - azure.endpoint=https://resourceusagemetric.dfs.core.windows.net/
+    depends_on:
+      - postgres
+      - minio
+    volumes:
+      - ./rest_data:/data  # Adjust as needed, but SQLite volume is no longer needed
+
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    networks:
+      iceberg_net:
+    ports:
+      - "8081:8080"  # Trino Web UI
+      - "8443:8443"  # Trino HTTPS (SSL)
+    volumes:
+      - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties
+      - ./trino/config.properties:/etc/trino/config.properties
+      - ./trino/keycloak-public-key.pem:/etc/trino/keycloak-public-key.pem
+      #- ./trino/access-control.properties:/etc/access-control.properties
+      - ./trino/trino.pem:/etc/trino.pem
+      - ./trino/log.properties:/etc/trino/log.properties
+    depends_on:
+      - rest
+      - minio
+      - postgres  # Ensure Trino starts after PostgreSQL is available
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=minio
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - ./minio_data/warehouse:/data  # Mount a local folder for MinIO persistence
+
+ 
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    networks:
+      iceberg_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc policy set public minio/warehouse;
+      tail -f /dev/null
+      "
+
+networks:
+  iceberg_net:
+    external: true 
+
+volumes:
+  postgres_data:  # PostgreSQL data persistence
+  minio_data:
