@@ -1,0 +1,230 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+---
+version: "3"
+
+services:
+
+  rest:
+    build: ./rest
+    container_name: iceberg-rest
+    networks:
+      iceberg_net:
+    ports:
+      - 8181:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      #- CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - REST_CATALOG_SERVICE_PORT=8181
+      - CATALOG_JDBC_PASSWORD=password
+      - CATALOG_JDBC_USER=user
+      - REST_CATALOG_SERVICE_SERVICE_PORT=8181
+      - REST_CATALOG_SERVICE_HOST=10.0.238.1  # Adjust based on your setup
+      - CATALOG_URI=jdbc:sqlite:/data/iceberg_rest.db 
+      - fs.native-azure.enabled=true
+      - azure.auth-type=ACCESS_KEY
+      #azure.application-id = Trino
+      - azure.endpoint=https://resourceusagemetric.dfs.core.windows.net/
+    volumes:
+      - ./sqlite_data:/data 
+  trino:
+    image: trinodb/trino
+    container_name: trino
+    networks:
+      iceberg_net:
+    ports:
+      - "8081:8080"  # Trino Web UI
+    volumes:
+      - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties
+    depends_on:
+      - rest
+      - minio
+  gravitino:
+    image: apache/gravitino:0.8.0-incubating
+    container_name: gravitino
+    volumes:
+      - ./gravitino/gravitino-config.properties:/etc/gravitino/config.properties
+      - ./gravitino/gravitino.conf:/root/gravitino/conf/gravitino.conf
+      - gravitino_data:/root/gravitino/data 
+    command: [ "server", "/etc/gravitino/config.properties" ]
+    depends_on:
+      - minio  #
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.gravitino
+    ports:
+      - 9002:9002  # Exposing Gravitino API for interactions (if needed)
+      - 8090:8090
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=minio
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - ./minio_data/warehouse:/data  # Mount a local folder for MinIO persistence
+  # Airflow Database (PostgreSQL)
+  postgres:
+    image: postgres:13
+    container_name: airflow_postgres
+    restart: always
+    networks:
+      iceberg_net:
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Airflow Webserver
+  airflow-webserver:
+    build: ./airflow  # Use custom Airflow Dockerfile
+    container_name: airflow-webserver
+    restart: always
+    depends_on:
+      - postgres
+      - airflow-init
+    networks:
+      iceberg_net:
+    ports:
+      - "8082:8080"
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=thisisaverysecretkey
+      - AIRFLOW__WEBSERVER__SECRET_KEY=supersecretkey
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    command: ["webserver"]
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    build: ./airflow  # Use custom Airflow Dockerfile
+    container_name: airflow-scheduler
+    restart: always
+    depends_on:
+      - airflow-webserver
+    networks:
+      iceberg_net:
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=thisisaverysecretkey
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    command: ["scheduler"]
+
+  # Airflow Worker
+  airflow-worker:
+    build: ./airflow  # Use custom Airflow Dockerfile
+    container_name: airflow-worker
+    restart: always
+    depends_on:
+      - airflow-scheduler
+    networks:
+      iceberg_net:
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow@postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=thisisaverysecretkey
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    command: ["celery", "worker"]
+
+  # Redis for Celery
+  redis:
+    image: redis:latest
+    container_name: airflow-redis
+    restart: always
+    networks:
+      iceberg_net:
+    ports:
+      - "6379:6379"
+
+  # Airflow DB Initialization
+  airflow-init:
+    build: ./airflow
+    container_name: airflow-init
+    depends_on:
+      - postgres
+    networks:
+      iceberg_net:
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    entrypoint: >
+      /bin/bash -c "
+      airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
+      "
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    networks:
+      iceberg_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc policy set public minio/warehouse;
+      tail -f /dev/null
+      "
+networks:
+  iceberg_net:
+    external: true 
+
+volumes:
+  sqlite_data:   # Volume to persist SQLite database
+  minio_data:
+  postgres_data:  # Database persistence
+  airflow_dags:   # Persist DAGs even after restart
+  airflow_logs:
+  airflow_plugins:
+  gravitino_data:
