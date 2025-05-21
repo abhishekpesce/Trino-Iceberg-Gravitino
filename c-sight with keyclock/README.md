@@ -1,1 +1,0 @@
-This is the repo explaining how to use keycloak with trino
